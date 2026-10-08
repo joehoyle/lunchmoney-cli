@@ -6,6 +6,10 @@ Use it to browse and filter transactions, manage categories and accounts, track
 monthly budgets, review AI suggestions one transaction at a time, or chat with an
 assistant that can query your account and carry out requested actions.
 
+![Terminal demo showing transaction tables, monthly budget bars, and accepting an AI review suggestion](docs/demo.gif)
+
+*Recorded with sample data and mock AI responses. [Read the demo transcript](docs/demo-transcript.txt).*
+
 ## Contents
 
 - [Install and authenticate](#install-and-authenticate)

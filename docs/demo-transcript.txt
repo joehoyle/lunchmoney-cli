@@ -1,0 +1,50 @@
+$ lunchmoney transactions list --month 2026-10
+Date       │ Payee        │ Category      │ Account  │     Amount
+───────────┼──────────────┼───────────────┼──────────┼───────────
+2026-10-02 │ SQ *CAFE KOO │ Uncategorized │ Chequing │  32.98 CAD
+2026-10-03 │ Metro        │ Groceries     │ Chequing │  68.42 CAD
+2026-10-04 │ Spotify      │ Subscriptions │ Chequing │  12.99 CAD
+
+3 transactions
+
+
+$ lunchmoney budgets view --month 2026-10
+Budget · 2026-10
+
+Category      │     Budget │      Spent │  Remaining │ Budget used
+──────────────┼────────────┼────────────┼────────────┼───────────────
+Dining        │ 250.00 CAD │ 182.98 CAD │  67.02 CAD │ ███████░░░ 73%
+Groceries     │ 500.00 CAD │ 321.42 CAD │ 178.58 CAD │ ██████░░░░ 64%
+Subscriptions │  60.00 CAD │  52.99 CAD │   7.01 CAD │ █████████░ 88%
+
+3 budget categories
+Usage = spent / budget; remaining = available balance (includes rollovers).
+
+
+$ lunchmoney transactions review --month 2026-10 --no-web-search
+Date       │ Payee        │ Category      │ Account  │     Amount
+───────────┼──────────────┼───────────────┼──────────┼───────────
+2026-10-02 │ SQ *CAFE KOO │ Uncategorized │ Chequing │  32.98 CAD
+2026-10-03 │ Metro        │ Groceries     │ Chequing │  68.42 CAD
+2026-10-04 │ Spotify      │ Subscriptions │ Chequing │  12.99 CAD
+
+3 transactions
+
+AI review with openai::demo. Transaction details and category definitions go to this provider.
+Enter skips; changes are saved only when accepted.
+Loading full details for 3 transactions…
+Checking earlier transaction history…
+Asking AI to review 3 transactions as one batch… 1 transactions with suggested changes; 0 need clarification; 2 have no flagged issues.
+
+Transaction 1/3 · ID 101
+  ID │ Date       │ Payee    │ Category │ Account  │     Amount │ Status   │ Tags   │ Notes    │ Source
+─────┼────────────┼──────────┼──────────┼──────────┼────────────┼──────────┼────────┼──────────┼───────
+ 101 │ 2026-10-02 │ SQ *CAFE │ Uncatego │ Chequing │  32.98 CAD │ Unrevie… │ —      │ Dinner … │ —
+     │            │  KOO     │ rized    │          │            │          │        │          │
+     │            │ Cafe Koo │ Dining   │          │            │          │        │          │
+Original: SQ *CAFE KOO
+Reason (high confidence): Bank merchant name and dinner note point to Dining.
+[a] accept both · [c] category only · [n] name only · [t] chat about this · [s] skip (default) · [d] details · [q] quit: a
+Saved.
+
+Review finished: 1 accepted · 1 changed · 0 skipped.
