@@ -27,12 +27,40 @@ assistant that can query your account and carry out requested actions.
 
 ## Install and authenticate
 
-Install from this checkout with a Rust toolchain that supports edition 2024:
+Download a binary archive from [GitHub Releases](https://github.com/joehoyle/lunchmoney-cli/releases)
+for your platform:
+
+| Platform | Archive |
+| --- | --- |
+| macOS (Apple Silicon) | `lunchmoney-aarch64-apple-darwin.tar.gz` |
+| macOS (Intel) | `lunchmoney-x86_64-apple-darwin.tar.gz` |
+| Linux (x86_64, glibc 2.35+) | `lunchmoney-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux (ARM64, glibc 2.35+) | `lunchmoney-aarch64-unknown-linux-gnu.tar.gz` |
+
+Extract the archive and put the `lunchmoney` executable on your `PATH`.
+Each release includes `SHA256SUMS` to verify the downloaded archives.
+
+Or install from this checkout with a Rust toolchain that supports edition 2024:
 
 ```sh
 cargo install --path .
 lunchmoney auth login
 ```
+
+For downloaded binaries, run `lunchmoney auth login` after installation too.
+
+To publish a release, update the version in `Cargo.toml` and `Cargo.lock`, commit
+the changes along with the release workflow, then push a tag such as `v0.1.0`:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Every pushed tag runs the release workflow, which tests and builds all four
+platforms before publishing the archives and checksums to the matching GitHub
+release. If the release does not exist, the workflow creates it with generated
+release notes. Rerunning the workflow replaces assets with the same names.
 
 `auth login` prompts with hidden input and saves your Lunch Money developer API
 token for future shells. The saved token is a local JSON file. On Unix, the
