@@ -1,5 +1,8 @@
+mod ai;
+mod review;
+
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
@@ -7,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::Value;
@@ -54,6 +57,11 @@ struct Cli {
 enum Commands {
     /// Show the authenticated user's profile.
     Me,
+    /// Configure AI and chat about your account or review transactions.
+    Ai {
+        #[command(subcommand)]
+        command: ai::AiCommand,
+    },
     /// Work with transactions.
     #[command(alias = "tx")]
     Transactions {
@@ -117,7 +125,9 @@ enum Auth {
 enum Transactions {
     /// List this month's transactions. Use --month YYYY-MM for another month.
     #[command(alias = "ls")]
-    List(TransactionList),
+    List(Box<TransactionList>),
+    /// Interactively review categories and transaction names with AI.
+    Review(Box<review::ReviewArgs>),
     /// Fetch one transaction by ID.
     #[command(alias = "show")]
     Get { id: i64 },
@@ -156,6 +166,12 @@ struct TransactionList {
     #[arg(long)]
     /// Filter by category or category-group ID; use 0 for uncategorized.
     category_id: Option<i64>,
+    /// Filter by category or group name (case-insensitive exact match).
+    #[arg(long, value_name = "NAME", conflicts_with = "category_id")]
+    category: Option<String>,
+    /// Filter payee names by case-insensitive substring. Searches all pages in the date range.
+    #[arg(long, value_name = "TEXT")]
+    payee: Option<String>,
     #[arg(long)]
     /// Filter by manual account ID; use 0 to exclude manual accounts.
     manual_account_id: Option<i64>,
@@ -205,7 +221,7 @@ struct TransactionList {
     /// Number of records per request (1-1000).
     #[arg(long, default_value_t = 25)]
     limit: usize,
-    /// Zero-based page offset. Ignored when --all is used.
+    /// Zero-based page offset. Ignored with --all, a month scope, or --payee.
     #[arg(long, default_value_t = 0)]
     offset: usize,
     /// Follow pagination until the API reports there are no more results.
@@ -257,6 +273,8 @@ enum ResourceCommand {
 
 #[derive(Debug, Subcommand)]
 enum Budgets {
+    /// Visualize spending and remaining budget by category for a calendar month.
+    View(MonthBudgetArgs),
     /// Show the account's budget period settings.
     Settings,
     /// Create or update a budget from a JSON object.
@@ -268,6 +286,13 @@ enum Budgets {
         #[arg(long)]
         start_date: String,
     },
+}
+
+#[derive(Debug, clap::Args)]
+struct MonthBudgetArgs {
+    /// Calendar month (YYYY-MM). Defaults to the current month in your local timezone.
+    #[arg(long, value_name = "YYYY-MM")]
+    month: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -385,6 +410,7 @@ enum TableKind {
     ManualAccounts,
     Recurring,
     Summary,
+    BudgetView,
 }
 
 #[derive(Clone, Default)]
@@ -393,6 +419,8 @@ struct RenderContext {
     accounts: HashMap<i64, String>,
     tags: HashMap<i64, String>,
     currency: Option<String>,
+    budget_excluded: HashSet<i64>,
+    budget_categories: Vec<Value>,
 }
 
 struct Api {
@@ -504,9 +532,34 @@ impl Api {
     }
 }
 
+fn parse_cli() -> Cli {
+    let mut command = Cli::command();
+    match command.try_get_matches_from_mut(env::args_os()) {
+        Ok(matches) => Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit()),
+        Err(error) => {
+            if error.kind() == clap::error::ErrorKind::MissingSubcommand {
+                if let Some(clap::error::ContextValue::String(path)) =
+                    error.get(clap::error::ContextKind::InvalidSubcommand)
+                {
+                    let mut group = &mut command;
+                    for name in path.split_whitespace().skip(1) {
+                        group = group
+                            .find_subcommand_mut(name)
+                            .unwrap_or_else(|| error.exit());
+                    }
+                    group.print_help().expect("could not print command help");
+                    println!();
+                    std::process::exit(0);
+                }
+            }
+            error.exit()
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run(Cli::parse()).await {
+    if let Err(error) = run(parse_cli()).await {
         eprintln!("error: {error:#}");
         std::process::exit(1);
     }
@@ -519,6 +572,15 @@ async fn run(cli: Cli) -> Result<()> {
     }
     if let Commands::Auth { command } = cli.command {
         return auth(command, cli.token.as_deref());
+    }
+    if let Commands::Ai {
+        command: ai::AiCommand::Chat(args),
+    } = &cli.command
+    {
+        return ai::chat::run(&Api::new(&cli)?, args).await;
+    }
+    if let Commands::Ai { command } = cli.command {
+        return ai::run(command, cli.compact, cli.output).await;
     }
     let api = Api::new(&cli)?;
     match cli.command {
@@ -539,6 +601,9 @@ async fn run(cli: Cli) -> Result<()> {
             };
             api.print_as(&value, TableKind::Summary, &context)
         }
+        Commands::Budgets {
+            command: Budgets::View(args),
+        } => budget_view(&api, args).await,
         Commands::Budgets {
             command: Budgets::Settings,
         } => api.print(
@@ -614,8 +679,256 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?,
         ),
-        Commands::Completion { .. } | Commands::Auth { .. } => unreachable!(),
+        Commands::Completion { .. } | Commands::Auth { .. } | Commands::Ai { .. } => unreachable!(),
     }
+}
+
+async fn budget_view(api: &Api, args: MonthBudgetArgs) -> Result<()> {
+    let month = args.month.map(Ok).unwrap_or_else(current_month)?;
+    let (start_date, end_date) = month_range(&month)?;
+    let value = api
+        .request(
+            Method::GET,
+            "/summary",
+            &[
+                ("start_date".into(), start_date),
+                ("end_date".into(), end_date),
+            ],
+            None,
+        )
+        .await?;
+    if !api.wants_table() {
+        return api.print(&value);
+    }
+    // Category metadata is required to keep income and transfers out of spending.
+    let categories = api.request(Method::GET, "/categories", &[], None).await?;
+    let me = api.request(Method::GET, "/me", &[], None).await?;
+    let mut context = RenderContext {
+        currency: me
+            .get("primary_currency")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        ..RenderContext::default()
+    };
+    collect_names(&mut context.categories, &categories, "categories");
+    if let Some(items) = categories.get("categories").and_then(Value::as_array) {
+        collect_budget_exclusions(&mut context.budget_excluded, items, false);
+        context.budget_categories = items.clone();
+    }
+    let mut out = io::stdout().lock();
+    writeln!(out, "Budget · {month}\n")?;
+    render_table(
+        &mut out,
+        &value,
+        TableKind::BudgetView,
+        &context,
+        api.wide,
+        io::stdout().is_terminal(),
+    )?;
+    writeln!(
+        out,
+        "Usage = spent / budget; remaining = available balance (includes rollovers)."
+    )?;
+    Ok(())
+}
+
+fn collect_budget_exclusions(excluded: &mut HashSet<i64>, items: &[Value], inherited: bool) {
+    for item in items {
+        let skip = inherited
+            || ["is_income", "exclude_from_budget"]
+                .iter()
+                .any(|key| item.get(key).and_then(Value::as_bool) == Some(true));
+        if skip && let Some(id) = item.get("id").and_then(Value::as_i64) {
+            excluded.insert(id);
+        }
+        if let Some(children) = item.get("children").and_then(Value::as_array) {
+            collect_budget_exclusions(excluded, children, skip);
+        }
+    }
+}
+
+// Build presentation rows separately so JSON output remains the API response.
+fn grouped_budget_summary(value: &Value, context: &RenderContext) -> Value {
+    fn metadata(items: &[Value], parent: Option<i64>, nodes: &mut HashMap<i64, Value>) {
+        for item in items {
+            if let Some(id) = item.get("id").and_then(Value::as_i64) {
+                let mut node = item.clone();
+                if let Some(parent) = parent {
+                    node["group_id"] = parent.into();
+                }
+                nodes.insert(id, node);
+                if let Some(children) = item.get("children").and_then(Value::as_array) {
+                    metadata(children, Some(id), nodes);
+                }
+            }
+        }
+    }
+    fn append(
+        id: i64,
+        depth: usize,
+        nodes: &HashMap<i64, Value>,
+        summaries: &HashMap<i64, Value>,
+        excluded: &HashSet<i64>,
+        visited: &mut HashSet<i64>,
+        output: &mut Vec<Value>,
+    ) {
+        if excluded.contains(&id) || !visited.insert(id) {
+            return;
+        }
+        let mut children: Vec<_> = nodes
+            .keys()
+            .copied()
+            .filter(|child| nodes[child].get("group_id").and_then(Value::as_i64) == Some(id))
+            .collect();
+        children.sort_by_key(|child| {
+            (
+                nodes[child]
+                    .get("order")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
+                *child,
+            )
+        });
+        let mut descendants = Vec::new();
+        for child in children {
+            append(
+                child,
+                depth + 1,
+                nodes,
+                summaries,
+                excluded,
+                visited,
+                &mut descendants,
+            );
+        }
+        let group =
+            nodes.get(&id).is_some_and(|node| node["is_group"] == true) || !descendants.is_empty();
+        let mut row = if let Some(row) = summaries.get(&id) {
+            row.clone()
+        } else if !descendants.is_empty() {
+            // A missing group summary is a subtotal of its immediate children.
+            let mut totals = serde_json::Map::new();
+            for key in [
+                "budgeted",
+                "other_activity",
+                "recurring_activity",
+                "available",
+            ] {
+                let amounts: Vec<_> = descendants
+                    .iter()
+                    .filter(|row| row["budget_depth"] == depth + 1)
+                    .filter_map(|row| {
+                        row.get("totals")
+                            .and_then(|totals| totals.get(key))
+                            .and_then(number_value)
+                    })
+                    .collect();
+                if !amounts.is_empty() {
+                    totals.insert(key.into(), amounts.iter().sum::<f64>().into());
+                }
+            }
+            serde_json::json!({"category_id": id, "totals": totals})
+        } else {
+            return;
+        };
+        let name = nodes
+            .get(&id)
+            .and_then(|node| node.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Category {id}"));
+        row["budget_label"] = format!(
+            "{}{}{name}",
+            "  ".repeat(depth),
+            if depth > 0 { "↳ " } else { "" }
+        )
+        .into();
+        row["budget_group"] = group.into();
+        row["budget_depth"] = depth.into();
+        row["shared_budget"] = false.into();
+        let group_budget = group
+            && summaries.contains_key(&id)
+            && get_path(&row, "totals.budgeted")
+                .and_then(number_value)
+                .is_some_and(|n| n > 0.0);
+        for child in &mut descendants {
+            if child["budget_depth"] == depth + 1
+                && group_budget
+                && !get_path(child, "totals.budgeted")
+                    .and_then(number_value)
+                    .is_some_and(|n| n > 0.0)
+            {
+                child["shared_budget"] = true.into();
+            }
+        }
+        output.push(row);
+        output.extend(descendants);
+    }
+    let mut nodes = HashMap::new();
+    metadata(&context.budget_categories, None, &mut nodes);
+    let summaries: HashMap<_, _> = table_rows(value, TableKind::BudgetView)
+        .into_iter()
+        .filter_map(|row| Some((row.get("category_id")?.as_i64()?, row.clone())))
+        .collect();
+    // Preserve categories absent from metadata, including uncategorized activity.
+    for id in summaries.keys() {
+        nodes.entry(*id).or_insert_with(|| serde_json::json!({"id": id, "name": context.categories.get(id).cloned().unwrap_or_else(|| format!("Category {id}"))}));
+    }
+    let mut roots: Vec<_> = nodes
+        .keys()
+        .copied()
+        .filter(|id| {
+            !nodes[id]
+                .get("group_id")
+                .and_then(Value::as_i64)
+                .is_some_and(|parent| nodes.contains_key(&parent))
+        })
+        .collect();
+    roots.sort_by_key(|id| {
+        (
+            nodes[id].get("order").and_then(Value::as_i64).unwrap_or(0),
+            *id,
+        )
+    });
+    let mut visited = HashSet::new();
+    let mut output = Vec::new();
+    for id in roots {
+        append(
+            id,
+            0,
+            &nodes,
+            &summaries,
+            &context.budget_excluded,
+            &mut visited,
+            &mut output,
+        );
+    }
+    output.retain(|row| {
+        get_path(row, "totals.budgeted")
+            .and_then(number_value)
+            .unwrap_or(0.0)
+            != 0.0
+            || summary_spent(row) != 0.0
+    });
+    serde_json::json!({"categories": output})
+}
+
+fn budget_usage(row: &Value) -> String {
+    let Some(budget) = get_path(row, "totals.budgeted").and_then(number_value) else {
+        return "No budget".into();
+    };
+    if budget <= 0.0 {
+        return "No budget".into();
+    }
+    let spent = summary_spent(row);
+    let ratio = (spent / budget).max(0.0);
+    let filled = (ratio.min(1.0) * 10.0).round() as usize;
+    format!(
+        "{}{} {:.0}%",
+        "█".repeat(filled),
+        "░".repeat(10 - filled),
+        ratio * 100.0
+    )
 }
 
 fn auth(command: Auth, supplied_token: Option<&str>) -> Result<()> {
@@ -658,8 +971,8 @@ fn auth(command: Auth, supplied_token: Option<&str>) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn prompt_for_token() -> Result<String> {
-    eprint!("Lunch Money API token: ");
+fn prompt_for_secret(label: &str) -> Result<String> {
+    eprint!("{label}: ");
     io::stderr().flush()?;
     Command::new("stty")
         .arg("-echo")
@@ -683,10 +996,14 @@ fn prompt_for_token() -> Result<String> {
 }
 
 #[cfg(not(unix))]
-fn prompt_for_token() -> Result<String> {
+fn prompt_for_secret(_: &str) -> Result<String> {
     bail!(
         "interactive token entry is only supported on Unix; set LUNCH_MONEY_TOKEN and run `lunchmoney auth login`"
     )
+}
+
+fn prompt_for_token() -> Result<String> {
+    prompt_for_secret("Lunch Money API token")
 }
 
 fn token_file() -> Result<PathBuf> {
@@ -768,59 +1085,10 @@ fn restrict_file_permissions(_: &Path) -> Result<()> {
 
 async fn transactions(api: &Api, command: Transactions) -> Result<()> {
     match command {
+        Transactions::Review(args) => review::run(api, *args).await,
         Transactions::List(mut args) => {
-            if args.start_date.is_some() != args.end_date.is_some() {
-                bail!("--start-date and --end-date must be used together");
-            }
-            if args.limit == 0 || args.limit > 1000 {
-                bail!("--limit must be between 1 and 1000");
-            }
-            let month_scope = if let Some(month) = args.month.clone() {
-                Some(month)
-            } else if args.start_date.is_none() && args.end_date.is_none() {
-                Some(current_month()?)
-            } else {
-                None
-            };
-            if let Some(month) = &month_scope {
-                apply_month_scope(&mut args, month)?;
-            }
-            let fetch_all = args.all || month_scope.is_some();
-            let mut query = transaction_query(&args, args.offset);
-            if !fetch_all {
-                let value = api
-                    .request(Method::GET, "/transactions", &query, None)
-                    .await?;
-                let context = if api.wants_table() {
-                    transaction_context(api).await
-                } else {
-                    RenderContext::default()
-                };
-                return api.print_as(&value, TableKind::Transactions, &context);
-            }
-            let mut results = Vec::new();
-            let mut offset = 0;
-            loop {
-                query = transaction_query(&args, offset);
-                let page = api
-                    .request(Method::GET, "/transactions", &query, None)
-                    .await?;
-                let items = page
-                    .get("transactions")
-                    .and_then(Value::as_array)
-                    .context("unexpected transactions response")?;
-                let count = items.len();
-                results.extend(items.iter().cloned());
-                let has_more = page
-                    .get("has_more")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(count == args.limit);
-                if !has_more || count == 0 {
-                    break;
-                }
-                offset += count;
-            }
-            let value = serde_json::json!({ "transactions": results, "has_more": false });
+            let fetch_all = prepare_transaction_list(api, &mut args).await?;
+            let value = fetch_transactions(api, &args, fetch_all).await?;
             let context = if api.wants_table() {
                 transaction_context(api).await
             } else {
@@ -853,6 +1121,129 @@ async fn transactions(api: &Api, command: Transactions) -> Result<()> {
         Transactions::Delete { id } => api.print(
             &api.request(Method::DELETE, &format!("/transactions/{id}"), &[], None)
                 .await?,
+        ),
+    }
+}
+
+async fn prepare_transaction_list(api: &Api, args: &mut TransactionList) -> Result<bool> {
+    if args
+        .payee
+        .as_deref()
+        .is_some_and(|payee| payee.trim().is_empty())
+    {
+        bail!("--payee must not be empty");
+    }
+    if args.start_date.is_some() != args.end_date.is_some() {
+        bail!("--start-date and --end-date must be used together");
+    }
+    if args.limit == 0 || args.limit > 1000 {
+        bail!("--limit must be between 1 and 1000");
+    }
+    let month_scope = if let Some(month) = args.month.clone() {
+        Some(month)
+    } else if args.start_date.is_none() && args.end_date.is_none() {
+        Some(current_month()?)
+    } else {
+        None
+    };
+    if let Some(month) = &month_scope {
+        apply_month_scope(args, month)?;
+    }
+    if let Some(name) = &args.category {
+        let categories = api.request(Method::GET, "/categories", &[], None).await?;
+        args.category_id = Some(resolve_category_name(&categories, name)?);
+    }
+    Ok(args.all || month_scope.is_some() || args.payee.is_some())
+}
+
+async fn fetch_transactions(api: &Api, args: &TransactionList, fetch_all: bool) -> Result<Value> {
+    if !fetch_all && args.payee.is_none() {
+        return api
+            .request(
+                Method::GET,
+                "/transactions",
+                &transaction_query(args, args.offset),
+                None,
+            )
+            .await;
+    }
+    let mut results = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = api
+            .request(
+                Method::GET,
+                "/transactions",
+                &transaction_query(args, offset),
+                None,
+            )
+            .await?;
+        let items = page
+            .get("transactions")
+            .and_then(Value::as_array)
+            .context("unexpected transactions response")?;
+        let count = items.len();
+        results.extend(items.iter().cloned());
+        let has_more = page
+            .get("has_more")
+            .and_then(Value::as_bool)
+            .unwrap_or(count == args.limit);
+        if !has_more || count == 0 {
+            break;
+        }
+        offset += count;
+    }
+    if let Some(payee) = &args.payee {
+        let needle = payee.trim().to_lowercase();
+        results.retain(|transaction| {
+            transaction["payee"]
+                .as_str()
+                .is_some_and(|name| name.to_lowercase().contains(&needle))
+        });
+    }
+    Ok(serde_json::json!({"transactions": results, "has_more": false}))
+}
+
+fn resolve_category_name(categories: &Value, name: &str) -> Result<i64> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("--category must not be empty");
+    }
+    let needle = name.to_lowercase();
+    fn find(items: &[Value], needle: &str, matches: &mut HashSet<i64>) {
+        for item in items {
+            if ["name", "display_name"].iter().any(|key| {
+                item.get(key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.to_lowercase() == needle)
+            }) && let Some(id) = item.get("id").and_then(Value::as_i64)
+            {
+                matches.insert(id);
+            }
+            if let Some(children) = item.get("children").and_then(Value::as_array) {
+                find(children, needle, matches);
+            }
+        }
+    }
+    let items = categories
+        .get("categories")
+        .and_then(Value::as_array)
+        .context("unexpected categories response")?;
+    let mut matches = HashSet::new();
+    find(items, &needle, &mut matches);
+    let mut ids: Vec<_> = matches.into_iter().collect();
+    ids.sort_unstable();
+    match ids.as_slice() {
+        [id] => Ok(*id),
+        [] => bail!(
+            "no category named {name:?}; use `lunchmoney categories list` to see category names"
+        ),
+        _ => bail!(
+            "category name {name:?} is ambiguous (IDs: {}); use --category-id to choose one",
+            ids.iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
     }
 }
@@ -1223,6 +1614,13 @@ fn render_table(
     if kind == TableKind::Categories {
         collect_names(&mut effective_context.categories, value, "categories");
     }
+    let grouped;
+    let value = if kind == TableKind::BudgetView {
+        grouped = grouped_budget_summary(value, context);
+        &grouped
+    } else {
+        value
+    };
     let rows = table_rows(value, kind);
     if rows.is_empty() {
         writeln!(out, "No {} found.", resource_name(kind))?;
@@ -1260,17 +1658,37 @@ fn render_table(
         .collect();
     write_table_row(out, &headers, &columns, &widths, true, color, kind)?;
     write_table_rule(out, &widths)?;
-    for row in &cells {
+    for (row, source) in cells.iter().zip(&rows) {
+        let group = kind == TableKind::BudgetView && source["budget_group"] == true;
+        if group && color {
+            write!(out, "\x1b[1m")?;
+        }
         write_table_row(out, row, &columns, &widths, false, color, kind)?;
+        if group && color {
+            write!(out, "\x1b[0m")?;
+        }
     }
 
-    let count = rows.len();
+    let count = rows
+        .iter()
+        .filter(|row| row.get("budget_group").and_then(Value::as_bool) != Some(true))
+        .count();
     let noun = if count == 1 {
         resource_name_singular(kind)
     } else {
         resource_name(kind)
     };
     write!(out, "\n{count} {noun}")?;
+    if kind == TableKind::BudgetView {
+        let groups = rows.len() - count;
+        if groups > 0 {
+            write!(
+                out,
+                " · {groups} {}",
+                if groups == 1 { "group" } else { "groups" }
+            )?;
+        }
+    }
     if value.get("has_more").and_then(Value::as_bool) == Some(true) {
         write!(out, " • more available; use --all")?;
     }
@@ -1281,7 +1699,7 @@ fn render_table(
 fn table_rows(value: &Value, kind: TableKind) -> Vec<&Value> {
     let key = match kind {
         TableKind::Transactions => "transactions",
-        TableKind::Categories | TableKind::Summary => "categories",
+        TableKind::Categories | TableKind::Summary | TableKind::BudgetView => "categories",
         TableKind::Tags => "tags",
         TableKind::PlaidAccounts => "plaid_accounts",
         TableKind::ManualAccounts => "manual_accounts",
@@ -1337,6 +1755,13 @@ fn columns_for(kind: TableKind, wide: bool) -> Vec<ColumnSpec> {
             ColumnSpec::new("Category", "category", 8, 20),
             ColumnSpec::new("Status", "status", 8, 12),
         ],
+        TableKind::BudgetView => vec![
+            ColumnSpec::new("Category", "category", 8, 28),
+            ColumnSpec::new("Budget", "budgeted", 8, 18).right(),
+            ColumnSpec::new("Spent", "activity", 8, 18).right(),
+            ColumnSpec::new("Remaining", "available", 9, 18).right(),
+            ColumnSpec::new("Budget used", "usage", 10, 22),
+        ],
         TableKind::Summary => vec![
             ColumnSpec::new("Category", "category", 12, 28),
             ColumnSpec::new("Budgeted", "budgeted", 10, 16).right(),
@@ -1373,7 +1798,7 @@ fn columns_for(kind: TableKind, wide: bool) -> Vec<ColumnSpec> {
                 ColumnSpec::new("Missing", "missing", 7, 9).right(),
                 ColumnSpec::new("Description", "description", 10, 32),
             ]),
-            TableKind::Summary | TableKind::Generic => {}
+            TableKind::Summary | TableKind::BudgetView | TableKind::Generic => {}
         }
     }
     columns
@@ -1441,16 +1866,26 @@ fn table_cell(row: &Value, kind: TableKind, key: &str, context: &RenderContext) 
         (TableKind::Recurring, "status") => title_case(&value_at(row, "status")),
         (TableKind::Recurring, "missing") => array_len_at(row, "matches.missing_transaction_dates"),
         (TableKind::Recurring, "description") => value_at(row, "description"),
-        (TableKind::Summary, "category") => {
+        (TableKind::BudgetView, "category") if row.get("budget_label").is_some() => {
+            value_at(row, "budget_label")
+        }
+        (TableKind::BudgetView, "available") if row["shared_budget"] == true => "—".into(),
+        (TableKind::BudgetView, "usage") if row["shared_budget"] == true => "Shared budget".into(),
+        (TableKind::Summary | TableKind::BudgetView, "category") => {
             named_id(row, "category_id", &context.categories, "Unknown")
         }
-        (TableKind::Summary, "budgeted") => money_at(row, "totals.budgeted", "", context),
-        (TableKind::Summary, "activity") => summary_activity(row, context),
-        (TableKind::Summary, "available") => money_at(row, "totals.available", "", context),
+        (TableKind::Summary | TableKind::BudgetView, "budgeted") => {
+            money_at(row, "totals.budgeted", "", context)
+        }
+        (TableKind::Summary | TableKind::BudgetView, "activity") => summary_activity(row, context),
+        (TableKind::Summary | TableKind::BudgetView, "available") => {
+            money_at(row, "totals.available", "", context)
+        }
         (TableKind::Summary, "expected") => money_at(row, "totals.recurring_expected", "", context),
         (TableKind::Summary, "remaining") => {
             money_at(row, "totals.recurring_remaining", "", context)
         }
+        (TableKind::BudgetView, "usage") => budget_usage(row),
         _ => value_at(row, key),
     }
 }
@@ -1643,14 +2078,15 @@ fn array_len_at(value: &Value, path: &str) -> String {
         .unwrap_or_else(|| "0".into())
 }
 
+fn summary_spent(value: &Value) -> f64 {
+    ["totals.other_activity", "totals.recurring_activity"]
+        .iter()
+        .filter_map(|path| get_path(value, path).and_then(number_value))
+        .sum()
+}
+
 fn summary_activity(value: &Value, context: &RenderContext) -> String {
-    let other = get_path(value, "totals.other_activity")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    let recurring = get_path(value, "totals.recurring_activity")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
-    format_money(other + recurring, context.currency.as_deref())
+    format_money(summary_spent(value), context.currency.as_deref())
 }
 
 fn money_at(
@@ -1787,7 +2223,15 @@ fn write_table_row(
         if index > 0 {
             write!(out, " │ ")?;
         }
-        let cell_color = if !muted_transaction && color && matches!(kind, TableKind::Transactions) {
+        let cell_color = if color && !header && kind == TableKind::BudgetView {
+            match columns[index].key {
+                "available" if value.starts_with('−') => Some("\x1b[31m"),
+                "available" if value != "—" => Some("\x1b[32m"),
+                "usage" if value == "No budget" => Some("\x1b[2m"),
+                "usage" => Some("\x1b[36m"),
+                _ => None,
+            }
+        } else if !muted_transaction && color && matches!(kind, TableKind::Transactions) {
             transaction_color(columns[index].key, value)
         } else {
             None
@@ -1796,7 +2240,7 @@ fn write_table_row(
         let value = pad(&value, widths[index], columns[index].align);
         if header && color {
             write!(out, "\x1b[1m{value}\x1b[0m")?;
-        } else if color && matches!(kind, TableKind::Transactions) {
+        } else if color && matches!(kind, TableKind::Transactions | TableKind::BudgetView) {
             if let Some(color) = cell_color {
                 write!(out, "{color}{value}\x1b[0m")?;
             } else {
@@ -1888,7 +2332,7 @@ fn resource_name(kind: TableKind) -> &'static str {
         TableKind::PlaidAccounts => "Plaid accounts",
         TableKind::ManualAccounts => "manual accounts",
         TableKind::Recurring => "recurring items",
-        TableKind::Summary => "budget categories",
+        TableKind::Summary | TableKind::BudgetView => "budget categories",
         TableKind::Generic => "results",
     }
 }
@@ -1901,7 +2345,7 @@ fn resource_name_singular(kind: TableKind) -> &'static str {
         TableKind::PlaidAccounts => "Plaid account",
         TableKind::ManualAccounts => "manual account",
         TableKind::Recurring => "recurring item",
-        TableKind::Summary => "budget category",
+        TableKind::Summary | TableKind::BudgetView => "budget category",
         TableKind::Generic => "result",
     }
 }
@@ -1933,16 +2377,14 @@ mod tests {
             "--all",
         ])
         .unwrap();
-        assert!(matches!(
-            cli.command,
-            Commands::Transactions {
-                command: Transactions::List(TransactionList {
-                    all: true,
-                    limit: 20,
-                    ..
-                })
-            }
-        ));
+        let Commands::Transactions {
+            command: Transactions::List(args),
+        } = cli.command
+        else {
+            panic!("expected transaction list");
+        };
+        assert!(args.all);
+        assert_eq!(args.limit, 20);
     }
     #[test]
     fn month_scope_uses_the_full_calendar_month() {
@@ -2118,6 +2560,234 @@ mod tests {
     #[test]
     fn unicode_truncation_respects_display_width() {
         assert_eq!(display_width(&fit_cell("Coffee ☕ shop", 8)), 8);
+    }
+
+    #[test]
+    fn budget_view_defaults_to_current_month_and_accepts_an_override() {
+        for (args, expected) in [
+            (vec!["lunchmoney", "budgets", "view"], None),
+            (
+                vec!["lunchmoney", "budgets", "view", "--month", "2024-02"],
+                Some("2024-02"),
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Commands::Budgets {
+                command: Budgets::View(args),
+            } = cli.command
+            else {
+                panic!("expected budget view");
+            };
+            assert_eq!(args.month.as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn budget_usage_handles_overspending_refunds_and_unbudgeted_categories() {
+        let row = serde_json::json!({"totals": {
+            "budgeted": "100", "other_activity": "80", "recurring_activity": 45,
+            "available": -25
+        }});
+        assert_eq!(summary_spent(&row), 125.0);
+        assert_eq!(budget_usage(&row), "██████████ 125%");
+        assert_eq!(
+            budget_usage(&serde_json::json!({"totals": {"budgeted": 100, "other_activity": -10}})),
+            "░░░░░░░░░░ 0%"
+        );
+        assert_eq!(
+            budget_usage(&serde_json::json!({"totals": {"budgeted": 0, "other_activity": 10}})),
+            "No budget"
+        );
+        assert_eq!(
+            budget_usage(&serde_json::json!({"totals": {"budgeted": null}})),
+            "No budget"
+        );
+    }
+
+    #[test]
+    fn monthly_view_uses_available_balance_and_filters_income_and_excluded_children() {
+        let categories = serde_json::json!({"categories": [
+            {"id": 1, "name": "Groceries"},
+            {"id": 2, "name": "Income", "is_income": true},
+            {"id": 3, "name": "Transfers", "exclude_from_budget": true, "children": [{"id": 4}]}
+        ]});
+        let mut context = RenderContext {
+            currency: Some("cad".into()),
+            ..RenderContext::default()
+        };
+        collect_names(&mut context.categories, &categories, "categories");
+        collect_budget_exclusions(
+            &mut context.budget_excluded,
+            categories["categories"].as_array().unwrap(),
+            false,
+        );
+        let value = serde_json::json!({"categories": [
+            {"category_id": 1, "totals": {"budgeted": 100, "other_activity": 40, "recurring_activity": 10, "available": 75}},
+            {"category_id": 2}, {"category_id": 4}
+        ]});
+        let mut output = Vec::new();
+        render_table(
+            &mut output,
+            &value,
+            TableKind::BudgetView,
+            &context,
+            false,
+            false,
+        )
+        .unwrap();
+        let table = String::from_utf8(output).unwrap();
+        assert!(table.contains("Groceries"));
+        assert!(table.contains("50.00 CAD"));
+        // The balance includes rollover; it must not be recomputed as budget minus spent.
+        assert!(table.contains("75.00 CAD"));
+        assert!(table.contains("50%"));
+        assert!(!table.contains("Income"));
+        assert!(table.contains("1 budget category"));
+        assert!(!table.contains("\x1b["));
+    }
+
+    #[test]
+    fn budget_groups_keep_authoritative_totals_and_show_shared_children() {
+        let context = RenderContext {
+            budget_categories: vec![
+                serde_json::json!({"id": 10, "name": "Food", "is_group": true,
+                "children": [{"id": 12, "name": "Dining", "order": 2}, {"id": 11, "name": "Groceries", "order": 1}, {"id": 13, "name": "Unused", "order": 3}]}),
+            ],
+            ..RenderContext::default()
+        };
+        let value = serde_json::json!({"categories": [
+            {"category_id": 12, "totals": {"budgeted": 0, "other_activity": 30, "available": -30}},
+            {"category_id": 10, "totals": {"budgeted": 500, "other_activity": 100, "available": 450}},
+            {"category_id": 11, "totals": {"budgeted": 0, "other_activity": 70, "available": -70}},
+            {"category_id": 13, "totals": {"budgeted": "0.00", "other_activity": 0, "recurring_activity": 0, "available": 25}},
+            {"category_id": 99, "totals": {"budgeted": 0, "other_activity": 0}}
+        ]});
+        let grouped = grouped_budget_summary(&value, &context);
+        let rows = grouped["categories"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|r| r["category_id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![10, 11, 12]
+        );
+        assert_eq!(rows[0]["totals"]["budgeted"], 500);
+        assert_eq!(rows[0]["totals"]["available"], 450);
+        assert_eq!(rows[1]["budget_label"], "  ↳ Groceries");
+        assert_eq!(
+            table_cell(&rows[1], TableKind::BudgetView, "usage", &context),
+            "Shared budget"
+        );
+        assert_eq!(
+            table_cell(&rows[1], TableKind::BudgetView, "available", &context),
+            "—"
+        );
+        assert_eq!(summary_spent(&rows[0]), 100.0);
+        assert_eq!(summary_spent(&rows[1]), 70.0);
+    }
+
+    #[test]
+    fn budget_groups_without_summary_roll_up_child_budgets_and_balances() {
+        let context = RenderContext {
+            // The flat category shape uses group_id rather than nested children.
+            budget_categories: vec![
+                serde_json::json!({"id": 10, "name": "Food", "is_group": true}),
+                serde_json::json!({"id": 11, "name": "Groceries", "group_id": 10}),
+                serde_json::json!({"id": 12, "name": "Dining", "group_id": 10}),
+                serde_json::json!({"id": 13, "name": "Hidden", "group_id": 10}),
+            ],
+            budget_excluded: HashSet::from([13]),
+            ..RenderContext::default()
+        };
+        let value = serde_json::json!({"categories": [
+            {"category_id": 11, "totals": {"budgeted": 100, "other_activity": 20, "recurring_activity": 10, "available": 90}},
+            {"category_id": 12, "totals": {"budgeted": 50, "other_activity": 25, "available": 25}},
+            {"category_id": 13, "totals": {"budgeted": 999, "other_activity": 999, "available": 999}},
+            {"category_id": 99, "totals": {"other_activity": 1}}
+        ]});
+        let grouped = grouped_budget_summary(&value, &context);
+        let rows = grouped["categories"].as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0]["totals"]["budgeted"], 150.0);
+        assert_eq!(rows[0]["totals"]["available"], 115.0);
+        assert_eq!(summary_spent(&rows[0]), 55.0);
+        assert_eq!(rows[1]["shared_budget"], false);
+        assert_eq!(rows[3]["category_id"], 99);
+        let mut output = Vec::new();
+        render_table(
+            &mut output,
+            &value,
+            TableKind::BudgetView,
+            &context,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("3 budget categories · 1 group")
+        );
+    }
+
+    #[test]
+    fn category_names_resolve_groups_children_and_display_names() {
+        let categories = serde_json::json!({"categories": [
+            {"id": 10, "name": "Food", "children": [
+                {"id": 11, "name": "Dining", "display_name": "Food: Dining"},
+                {"id": 12, "name": "Café"}
+            ]}
+        ]});
+        assert_eq!(resolve_category_name(&categories, " food ").unwrap(), 10);
+        assert_eq!(resolve_category_name(&categories, "DINING").unwrap(), 11);
+        assert_eq!(
+            resolve_category_name(&categories, "Food: Dining").unwrap(),
+            11
+        );
+        assert_eq!(resolve_category_name(&categories, "CAFÉ").unwrap(), 12);
+        assert!(resolve_category_name(&categories, "Din").is_err());
+        assert!(resolve_category_name(&categories, " ").is_err());
+    }
+
+    #[test]
+    fn category_names_reject_ambiguity_and_invalid_responses() {
+        let categories = serde_json::json!({"categories": [
+            {"id": 3, "name": "Coffee", "display_name": "Coffee"},
+            {"id": 2, "name": "COFFEE"}
+        ]});
+        let error = resolve_category_name(&categories, "coffee")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ambiguous (IDs: 2, 3)"));
+        assert!(error.contains("--category-id"));
+        assert!(resolve_category_name(&serde_json::json!({}), "Coffee").is_err());
+        let one = serde_json::json!({"categories": [{"id": 3, "name": "Coffee", "display_name": "Coffee"}]});
+        assert_eq!(resolve_category_name(&one, "Coffee").unwrap(), 3);
+    }
+
+    #[test]
+    fn category_name_argument_is_exclusive_with_category_id() {
+        let cli =
+            Cli::try_parse_from(["lunchmoney", "transactions", "list", "--category", "Dining"])
+                .unwrap();
+        let Commands::Transactions {
+            command: Transactions::List(args),
+        } = cli.command
+        else {
+            panic!("expected transactions");
+        };
+        assert_eq!(args.category.as_deref(), Some("Dining"));
+        assert!(
+            Cli::try_parse_from([
+                "lunchmoney",
+                "transactions",
+                "list",
+                "--category",
+                "Dining",
+                "--category-id",
+                "11"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
